@@ -74,7 +74,8 @@ class FSRS(nn.Module):
             new_d = new_d.clamp(1, 10)
         else:
             r = power_forgetting_curve(X[:,0], state[:,0])
-            new_d = state[:,1] - self.w[6] * (X[:,1] - 3)
+            a = self.surprise(r, X[:,1])
+            new_d = a * (state[:,1] - self.w[6] * (X[:,1] - 3)) + (1-a) * state[:,1]
             new_d = self.mean_reversion(self.w[4], new_d)
             new_d = new_d.clamp(1, 10)
             condition = X[:,1] > 1
@@ -96,6 +97,9 @@ class FSRS(nn.Module):
 
     def mean_reversion(self, init: Tensor, current: Tensor) -> Tensor:
         return self.w[7] * init + (1-self.w[7]) * current
+
+    def surprise(self, retrievability: Tensor, grade: Tensor) -> Tensor:
+        return torch.exp(-1 - (retrievability - 0.5) * (grade - 2))
 
 class WeightClipper:
     def __init__(self, frequency: int=1):
