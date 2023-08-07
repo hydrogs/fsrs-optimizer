@@ -15,8 +15,9 @@ dependencies = [
     "torch>=1.13.1",
     "tqdm>=4.64.1",
     "statsmodels>=0.13.5",
+    "Pillow>=10.0.0",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 
 [project.urls]
 Homepage = "https://github.com/open-spaced-repetition/fsrs-optimizer"
