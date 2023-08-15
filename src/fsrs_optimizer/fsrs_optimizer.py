@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import os
 import math
-from typing import List, Optional, Dict
+from typing import List, Optional
 from datetime import timedelta, datetime
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
@@ -15,9 +15,9 @@ from torch import nn
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from scipy.optimize import curve_fit, minimize
+from scipy.optimize import minimize
 from itertools import accumulate
 from tqdm.auto import tqdm
 import warnings
@@ -321,7 +321,7 @@ class Optimizer:
     def __init__(self) -> None:
         tqdm.pandas()
 
-    def anki_extract(self, filename: str, filter_out_suspended_cards: bool = False):
+    def anki_extract(self, filename: str, filter_out_suspended_cards: bool = False, filter_out_flags: List[int] = []):
         """Step 1"""
         # Extract the collection file or deck file to get the .anki21 database.
         with zipfile.ZipFile(f'{filename}', 'r') as zip_ref:
@@ -339,6 +339,10 @@ class Optimizer:
         else:
             raise Exception("Collection not exist!")
         cur = con.cursor()
+
+        def flags2str(flags: List[int]) -> str:
+            return f"({','.join(map(str, flags))})"
+        
         res = cur.execute(f"""
         SELECT *
         FROM revlog
@@ -347,6 +351,7 @@ class Optimizer:
             FROM cards
             WHERE queue != 0
             {"AND queue != -1" if filter_out_suspended_cards else ""}
+            {"AND flags NOT IN %s" % flags2str(filter_out_flags) if len(filter_out_flags) > 0 else ""}
         )
         """
         )
@@ -392,6 +397,8 @@ class Optimizer:
         df['i'] = df.groupby('card_id').cumcount() + 1
         df.loc[df['i'] == 1, 'delta_t'] = 0
         df = df.groupby('card_id').filter(lambda group: group['review_state'].iloc[0] == Learning)
+        if df.empty:
+            raise ValueError('Training data is inadequate.')
         df['prev_review_state'] = df.groupby('card_id')['review_state'].shift(1).fillna(Learning).astype(int)
         df['helper'] = ((df['review_state'] == Learning) & ((df['prev_review_state'] == Review) | (df['prev_review_state'] == Relearning)) & (df['i'] > 1)).astype(int)
         df['helper'] = df.groupby('card_id')['helper'].cumsum()
@@ -413,11 +420,22 @@ class Optimizer:
         def remove_outliers(group: pd.DataFrame) -> pd.DataFrame:
             # threshold = np.mean(group['delta_t']) * 1.5
             # threshold = group['delta_t'].quantile(0.95)
-            Q1 = group['delta_t'].quantile(0.25)
-            Q3 = group['delta_t'].quantile(0.75)
-            IQR = Q3 - Q1
-            threshold = Q3 + 1.5 * IQR
-            group = group[group['delta_t'] <= threshold]
+            # Q1 = group['delta_t'].quantile(0.25)
+            # Q3 = group['delta_t'].quantile(0.75)
+            # IQR = Q3 - Q1
+            # threshold = Q3 + 1.5 * IQR
+            # group = group[group['delta_t'] <= threshold]
+            grouped_group = group.groupby(by=['r_history', 'delta_t'], group_keys=False).agg({'y': ['mean', 'count']}).reset_index()
+            sort_index = grouped_group.sort_values(by=[('y', 'count'), "delta_t"], ascending=[True, False]).index
+
+            total = sum(grouped_group[('y', 'count')])
+            has_been_removed = 0
+            for i in sort_index:
+                count = grouped_group.loc[i, ('y', 'count')]
+                if has_been_removed + count >= total * 0.05:
+                    break
+                has_been_removed += count
+            group = group[group['delta_t'].isin(grouped_group[grouped_group[('y', 'count')] >= count]['delta_t'])]
             return group
 
         df[df['i'] == 2] = df[df['i'] == 2].groupby(by=['r_history', 't_history'], as_index=False, group_keys=False).apply(remove_outliers)
@@ -467,6 +485,8 @@ class Optimizer:
             return group
 
         df = df.groupby(by=['r_history'], group_keys=False).progress_apply(cal_stability)
+        if df.empty:
+            return "No enough data for stability calculation."
         tqdm.write("Stability calculated.")
         df.reset_index(drop = True, inplace = True)
         df.drop_duplicates(inplace=True)
@@ -505,7 +525,7 @@ class Optimizer:
         average_recall = self.dataset['y'].mean()
         plots = []
         s0_size = self.S0_dataset_group.shape[0]
-        rating_s0 = {
+        r_s0_default = {
             "1": 0.4,
             "2": 0.6,
             "3": 2.4,
@@ -522,7 +542,7 @@ class Optimizer:
             count = group['y']['count']
             total_count = sum(count)
 
-            init_s0 = rating_s0[first_rating]
+            init_s0 = r_s0_default[first_rating]
             
             def loss(stability):
                 y_pred = power_forgetting_curve(delta_t, stability)
@@ -554,67 +574,62 @@ class Optimizer:
                 plots.append(fig)
                 tqdm.write(str(rating_stability))
 
+        for small_rating, big_rating in ((1, 2), (2, 3), (3, 4), (1, 3), (2, 4), (1, 4)):
+            if small_rating in rating_stability and big_rating in rating_stability:
+                if rating_stability[small_rating] > rating_stability[big_rating]:
+                    if rating_count[small_rating] > rating_count[big_rating]:
+                        rating_stability[big_rating] = rating_stability[small_rating]
+                    else:
+                        rating_stability[small_rating] = rating_stability[big_rating]
+
+        w1 = 3/5
+        w2 = 3/5
+
         if len(rating_stability) == 0:
             raise Exception("Not enough data for pretraining!")
         elif len(rating_stability) == 1:
-            init_stability = round(list(rating_stability.values())[0], 2)
-            for i in (0, 1, 2, 3):
-                self.init_w[i] = init_stability
-        elif len(rating_stability) == 4:
-            for rating, stability in rating_stability.items():
-                self.init_w[rating-1] = round(stability, 2)
-            tqdm.write(f"Pretrain finished!")
-            return plots
-
-        def S0_rating_curve(rating, a, b, c):
-            return np.exp(a + b * rating) + c
-
-        params, covs = curve_fit(S0_rating_curve, list(rating_stability.keys()), list(rating_stability.values()), sigma=1/np.sqrt(list(rating_count.values())), method='dogbox', bounds=((-15, 0.03, -5), (15, 7, 30)))
-        if verbose:
-            tqdm.write(f'Weighted fit parameters: {params}')
-            predict_stability = S0_rating_curve(np.array(list(rating_stability.keys())), *params)
-            tqdm.write(f"Fit stability: {predict_stability}")
-            tqdm.write(f'RMSE: {mean_squared_error(list(rating_stability.values()), predict_stability, sample_weight=list(rating_count.values()), squared=False):.4f}')
-            fig = plt.figure()
-            ax = fig.gca()
-            ax.plot(list(rating_stability.keys()), list(rating_stability.values()), label='Exact')
-            ax.plot(np.linspace(1, 4), S0_rating_curve(np.linspace(1, 4), *params), label='Weighted fit')
-            scatter_size = np.array([x/sum(rating_count.values()) for x in rating_count.values()]) * 1000
-            ax.scatter(list(rating_stability.keys()), list(rating_stability.values()), scatter_size, label='Exact', alpha=0.5)
-            ax.legend(loc='upper right', fancybox=True, shadow=False)
-            ax.grid(True)
-            ax.set_xlabel('First rating')
-            ax.set_ylabel('Stability')
-            ax.set_title('Stability for first rating')
-            plots.append(fig)
-
-        for rating in (1, 2, 3, 4):
-            again_extrap = max(min(S0_rating_curve(1, *params), 30), 0.1)
-            # if there isn't enough data to calculate the value for "Again" exactly
+            rating = list(rating_stability.keys())[0]
+            factor = rating_stability[rating] / r_s0_default[str(rating)]
+            init_s0 = list(map(lambda x: x * factor, r_s0_default.values()))
+        elif len(rating_stability) == 2:
+            if 1 not in rating_stability and 2 not in rating_stability:
+                rating_stability[2] = np.power(rating_stability[3], 1/(1-w2)) * np.power(rating_stability[4], 1-1/(1-w2))
+                rating_stability[1] = np.power(rating_stability[2], 1/w1) * np.power(rating_stability[3], 1-1/w1)
+            elif 1 not in rating_stability and 3 not in rating_stability:
+                rating_stability[3] = np.power(rating_stability[2], 1-w2) * np.power(rating_stability[4], w2)
+                rating_stability[1] = np.power(rating_stability[2], 1/w1) * np.power(rating_stability[3], 1-1/w1)
+            elif 1 not in rating_stability and 4 not in rating_stability:
+                rating_stability[4] = np.power(rating_stability[2], 1-1/w2) * np.power(rating_stability[3], 1/w2)
+                rating_stability[1] = np.power(rating_stability[2], 1/w1) * np.power(rating_stability[3], 1-1/w1)
+            elif 2 not in rating_stability and 3 not in rating_stability:
+                rating_stability[2] = np.power(rating_stability[1], w1/(w1+w2-w1*w2)) * np.power(rating_stability[4], 1 - w1/(w1+w2-w1*w2))
+                rating_stability[3] = np.power(rating_stability[1], 1 - w2/(w1+w2-w1*w2)) * np.power(rating_stability[4], w2/(w1+w2-w1*w2))
+            elif 2 not in rating_stability and 4 not in rating_stability:
+                rating_stability[2] = np.power(rating_stability[1], w1) * np.power(rating_stability[3], 1-w1)
+                rating_stability[4] = np.power(rating_stability[2], 1-1/w2) * np.power(rating_stability[3], 1/w2)
+            elif 3 not in rating_stability and 4 not in rating_stability:
+                rating_stability[3] = np.power(rating_stability[1], 1-1/(1-w1)) * np.power(rating_stability[2], 1/(1-w1))
+                rating_stability[4] = np.power(rating_stability[2], 1-1/w2) * np.power(rating_stability[3], 1/w2)
+            init_s0 = [item[1] for item in sorted(rating_stability.items(), key=lambda x: x[0])]
+        elif len(rating_stability) == 3:
             if 1 not in rating_stability:
-                # then check if there exists an exact value for "Hard"
-                if 2 in rating_stability:
-                    # if it exists, then check whether the extrapolation breaks monotonicity
-                    # Again > Hard is possible, but we should allow it only for exact values, otherwise we should assume monotonicity
-                    if again_extrap > rating_stability[2]:
-                        # if it does, then replace the missing "Again" value with the exact "Hard" value
-                        rating_stability[1] = rating_stability[2]
-                    else:
-                        # if it doesn't break monotonicity, then use the extrapolated value
-                        rating_stability[1] = again_extrap
-                # if an exact value for "Hard" doesn't exist, then just use the extrapolation, there's nothing else we can do
-                else:
-                    rating_stability[1] = again_extrap
-            elif rating not in rating_stability:
-                rating_stability[rating] = max(min(S0_rating_curve(rating, *params), 30), 0.1)
+                rating_stability[1] = np.power(rating_stability[2], 1/w1) * np.power(rating_stability[3], 1-1/w1)
+            elif 2 not in rating_stability:
+                rating_stability[2] = np.power(rating_stability[1], w1) * np.power(rating_stability[3], 1-w1)
+            elif 3 not in rating_stability:
+                rating_stability[3] = np.power(rating_stability[2], 1-w2) * np.power(rating_stability[4], w2)
+            elif 4 not in rating_stability:
+                rating_stability[4] = np.power(rating_stability[2], 1-1/w2) * np.power(rating_stability[3], 1/w2)
+            init_s0 = [item[1] for item in sorted(rating_stability.items(), key=lambda x: x[0])]
+        elif len(rating_stability) == 4:
+            init_s0 = [item[1] for item in sorted(rating_stability.items(), key=lambda x: x[0])]
+        
+        self.init_w[0:4] = init_s0
 
-        rating_stability = {k: round(v, 2) for k, v in sorted(rating_stability.items(), key=lambda item: item[0])}
-        for rating, stability in rating_stability.items():
-            self.init_w[rating-1] = stability
         tqdm.write(f"Pretrain finished!")
         return plots
 
-    def train(self, lr: float = 4e-2, n_epoch: int = 5, n_splits: int = 5, batch_size: int = 512, verbose: bool = True):
+    def train(self, lr: float = 4e-2, n_epoch: int = 5, n_splits: int = 5, batch_size: int = 512, verbose: bool = True, split_by_time: bool = False):
         """Step 4"""
         self.dataset['tensor'] = self.dataset.progress_apply(lambda x: lineToTensor(list(zip([x['t_history']], [x['r_history']]))[0]), axis=1)
         self.dataset['group'] = self.dataset['r_history'] + self.dataset['t_history']
@@ -623,15 +638,34 @@ class Optimizer:
         w = []
         plots = []
         if n_splits > 1:
-            sgkf = StratifiedGroupKFold(n_splits=n_splits)
-            for train_index, test_index in sgkf.split(self.dataset, self.dataset['i'], self.dataset['group']):
-                tqdm.write(f"TRAIN: {len(train_index)} TEST: {len(test_index)}")
-                train_set = self.dataset.iloc[train_index].copy()
-                test_set = self.dataset.iloc[test_index].copy()
-                trainer = Trainer(train_set, test_set, self.init_w, n_epoch=n_epoch, lr=lr, batch_size=batch_size)
-                w.append(trainer.train(verbose=verbose))
-                if verbose:
-                    plots.append(trainer.plot())
+            if split_by_time:
+                tscv = TimeSeriesSplit(n_splits=n_splits)
+                self.dataset.sort_values(by=['review_time'], inplace=True)
+                for i, (train_index, test_index) in enumerate(tscv.split(self.dataset)):
+                    tqdm.write(f"TRAIN: {len(train_index)} TEST: {len(test_index)}")
+                    train_set = self.dataset.iloc[train_index].copy()
+                    test_set = self.dataset.iloc[test_index].copy()
+                    trainer = Trainer(train_set, test_set, self.init_w, n_epoch=n_epoch, lr=lr, batch_size=batch_size)
+                    w.append(trainer.train(verbose=verbose))
+                    self.w = w[-1]
+                    self.evaluate()
+                    metrics, figures = self.calibration_graph(self.dataset.iloc[test_index])
+                    print(metrics)
+                    for j, f in enumerate(figures):
+                        f.savefig(f"graph_{j}_test_{i}.png")
+                        plt.close(f)
+                    if verbose:
+                        plots.append(trainer.plot())
+            else:
+                sgkf = StratifiedGroupKFold(n_splits=n_splits)
+                for train_index, test_index in sgkf.split(self.dataset, self.dataset['i'], self.dataset['group']):
+                    tqdm.write(f"TRAIN: {len(train_index)} TEST: {len(test_index)}")
+                    train_set = self.dataset.iloc[train_index].copy()
+                    test_set = self.dataset.iloc[test_index].copy()
+                    trainer = Trainer(train_set, test_set, self.init_w, n_epoch=n_epoch, lr=lr, batch_size=batch_size)
+                    w.append(trainer.train(verbose=verbose))
+                    if verbose:
+                        plots.append(trainer.plot())
         else:
             trainer = Trainer(self.dataset, self.dataset, self.init_w, n_epoch=n_epoch, lr=lr, batch_size=batch_size)
             w.append(trainer.train(verbose=verbose))
@@ -840,12 +874,14 @@ class Optimizer:
         del tmp
         return loss_before, loss_after
 
-    def calibration_graph(self):
+    def calibration_graph(self, dataset=None):
+        if dataset is None:
+            dataset = self.dataset
         fig1 = plt.figure()
-        plot_brier(self.dataset['p'], self.dataset['y'], bins=40, ax=fig1.add_subplot(111))
+        metrics = plot_brier(dataset['p'], dataset['y'], bins=40, ax=fig1.add_subplot(111))
         fig2 = plt.figure(figsize=(16, 12))
         for last_rating in ("1","2","3","4"):
-            calibration_data = self.dataset[self.dataset['r_history'].str.endswith(last_rating)]
+            calibration_data = dataset[dataset['r_history'].str.endswith(last_rating)]
             if calibration_data.empty:
                 continue
             tqdm.write(f"\nLast rating: {last_rating}")
@@ -860,7 +896,7 @@ class Optimizer:
         lns = []
 
         stability_calibration = pd.DataFrame(columns=['stability', 'predicted_retention', 'actual_retention'])
-        stability_calibration = self.dataset[['stability', 'p', 'y']].copy()
+        stability_calibration = dataset[['stability', 'p', 'y']].copy()
         stability_calibration['bin'] = stability_calibration['stability'].map(lambda x: math.pow(1.2, math.floor(math.log(x, 1.2))))
         stability_group = stability_calibration.groupby('bin').count()
 
@@ -891,7 +927,7 @@ class Optimizer:
         lns = []
 
         difficulty_calibration = pd.DataFrame(columns=['difficulty', 'predicted_retention', 'actual_retention'])
-        difficulty_calibration = self.dataset[['difficulty', 'p', 'y']].copy()
+        difficulty_calibration = dataset[['difficulty', 'p', 'y']].copy()
         difficulty_calibration['bin'] = difficulty_calibration['difficulty'].map(round)
         difficulty_group = difficulty_calibration.groupby('bin').count()
 
@@ -915,7 +951,7 @@ class Optimizer:
         ax2.yaxis.set_major_formatter(ticker.FuncFormatter(to_percent))
         ax2.xaxis.set_major_formatter(ticker.FormatStrFormatter('%d'))
 
-        return fig1, fig2, fig3, fig4
+        return metrics, (fig1, fig2, fig3, fig4)
 
     def bw_matrix(self):
         B_W_Metric_raw = self.dataset[['difficulty', 'stability', 'p', 'y']].copy()
@@ -1030,6 +1066,12 @@ def plot_brier(predictions, real, bins=20, ax=None, title=None):
     ax2.legend(loc='lower center')
     if title:
         ax.set_title(title)
+    metrics = {
+        "R-squared": r2,
+        "RMSE": rmse,
+        "MAE": mae
+    }
+    return metrics
 
 def sm2(history):
     ivl = 0

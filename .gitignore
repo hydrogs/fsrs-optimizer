@@ -147,4 +147,7 @@ meta
 *.csv
 *.tsv
 *.png
+*.json
 .fsrs_optimizer
+*.ipynb
+*.zip
