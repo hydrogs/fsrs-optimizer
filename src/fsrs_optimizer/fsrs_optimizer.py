@@ -75,7 +75,7 @@ class FSRS(nn.Module):
         else:
             r = power_forgetting_curve(X[:,0], state[:,0])
             a = self.surprise(r, X[:,1])
-            new_d = state[:,1] - self.w[6] * a * (X[:,1] - 3 - self.w[17])
+            new_d = state[:,1] - self.w[6] * a * (X[:,1] - self.w[17])
             new_d = self.mean_reversion(self.w[4], new_d)
             new_d = new_d.clamp(1, 10)
             condition = X[:,1] > 1
@@ -99,7 +99,8 @@ class FSRS(nn.Module):
         return self.w[7] * init + (1-self.w[7]) * current
 
     def surprise(self, retrievability: Tensor, grade: Tensor) -> Tensor:
-        return torch.exp(self.w[18] -1 - (retrievability - 0.5) * (grade - 3 - self.w[19]))
+        exponent = (retrievability - self.w[19]) * (grade - self.w[20])
+        return torch.exp(- self.w[18] * exponent)
 
 class WeightClipper:
     def __init__(self, frequency: int=1):
@@ -488,7 +489,7 @@ class Optimizer:
 
     def define_model(self):
         """Step 3"""
-        self.init_w = [0.4, 0.6, 2.4, 5.8, 4.93, 0.94, 0.86, 0.01, 1.49, 0.14, 0.94, 2.18, 0.05, 0.34, 1.26, 0.29, 2.61, 0.0, 0.5, 1.0]
+        self.init_w = [0.4, 0.6, 2.4, 5.8, 4.93, 0.94, 0.86, 0.01, 1.49, 0.14, 0.94, 2.18, 0.05, 0.34, 1.26, 0.29, 2.61, 3.0, 0.5, 0.5, 2.15]
         '''
         For details about the parameters, please see: 
         https://github.com/open-spaced-repetition/fsrs4anki/wiki/The-Algorithm
